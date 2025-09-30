@@ -1,0 +1,12 @@
+{
+  "printf": ["<stdio.h>", "<cstdio>"],
+  "assert": ["<assert.h>"],
+  "uint8_t": ["<stdint.h>"],
+  "uint16_t": ["<stdint.h>"],
+  "uint32_t": ["<stdint.h>"],
+  "uint64_t": ["<stdint.h>"],
+  "bool": ["<stdbool.h>"],
+  "memcpy": ["<string.h>"],
+  "memset": ["<string.h>"],
+  "size_t": ["<stddef.h>"]
+}
