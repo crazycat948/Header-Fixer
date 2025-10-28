@@ -47,7 +47,7 @@ def insert_headers_safely(file_path: str, headers: list[str]) -> bool:
     new_lines = lines[:insert_idx] + to_insert + lines[insert_idx:]
 
     if insert_idx == 0:
-        new_lines.insert(len(to_insert), "")  # blank line after inserted block
+        new_lines.insert(len(to_insert), "")
 
     new_src = detect_eol(src).join(new_lines)
     if src.endswith(("\n", "\r\n")) and not new_src.endswith(("\n", "\r\n")):
@@ -95,8 +95,8 @@ def parse_missing_symbols(diag: str) -> set[str]:
         r"use of undeclared identifier “([A-Za-z_]\w*)”",
         r"unknown type name '([A-Za-z_]\w*)'",
         r"unknown type name “([A-Za-z_]\w*)”",
-        r"identifier '([A-Za-z_]\w*)' is undefined",     # MSVC
-        r"type name '([A-Za-z_]\w*)' is undefined",      # MSVC
+        r"identifier '([A-Za-z_]\w*)' is undefined",
+        r"type name '([A-Za-z_]\w*)' is undefined",
         r"\b([A-Za-z_]\w*)\b was not declared in this scope",
         r"no member named '([A-Za-z_]\w*)' in namespace 'std'",
     ]
@@ -151,10 +151,6 @@ def py_syntax_check(py_path: str) -> tuple[int, str]:
     return proc.returncode, diag
 
 def py_parse_existing_imports(src: str) -> set[str]:
-    """
-    Parse existing import statements to avoid duplicates.
-    Returns a set of imported root modules / aliases / member names.
-    """
     imported = set()
     for line in src.splitlines():
         line = line.strip()
@@ -188,15 +184,10 @@ def py_parse_existing_imports(src: str) -> set[str]:
     return imported
 
 def py_required_import_lines(src: str, py_map: dict) -> list[str]:
-    """
-    Decide which import lines are needed based on tokens present in source.
-    Uses simple token matching (MVP), de-duplicates, keeps order.
-    """
     needed = []
     imported = py_parse_existing_imports(src)
 
     for key, import_lines in py_map.items():
-        # Build essential names (module roots and imported names/aliases)
         essential_names = []
         for line in import_lines:
             s = line.strip()
@@ -218,11 +209,9 @@ def py_required_import_lines(src: str, py_map: dict) -> list[str]:
         if already_have:
             continue
 
-        # Only add if the key actually appears in source tokens
         if re.search(rf"\b{re.escape(key)}\b", src):
             needed.extend(import_lines)
 
-    # unique & preserve order
     seen, ordered = set(), []
     for ln in needed:
         if ln not in seen:
@@ -252,7 +241,6 @@ def handle_python(py_path: str):
     mapping = load_map()
     py_map = mapping.get("__python__", {})
 
-    # Static add of missing imports based on __python__ mapping
     missing_import_lines = py_required_import_lines(src, py_map)
     if missing_import_lines:
         print("➕ Inserting missing Python imports:", ", ".join(missing_import_lines))
@@ -272,7 +260,6 @@ def handle_python(py_path: str):
     print("⚠️ Python compile failed. Diagnostics:")
     print(diag)
 
-    # Fallback: if unittest usage still without import, add once
     uses_unittest = bool(re.search(r"\bunittest\b|\bTestCase\b", src))
     has_unittest_import = bool(re.search(r"^\s*import\s+unittest\b", src, re.M))
     if uses_unittest and not has_unittest_import:
@@ -305,7 +292,7 @@ def handle_header(header_path: str, mapping: dict):
         print("⚠️ Self-check failed, analyzing missing symbols…")
         missing = parse_missing_symbols(diag)
         if not missing:
-            hdrs = fallback_headers(is_cpp=True)  # most headers used in C++ tests
+            hdrs = fallback_headers(is_cpp=True)
         else:
             hdrs = headers_for_symbols(missing, mapping, is_cpp=True) or fallback_headers(is_cpp=True)
         print("➕ Inserting headers into the header file:", ", ".join(hdrs))
@@ -389,4 +376,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
