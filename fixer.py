@@ -1,16 +1,8 @@
-# fixer.py — compile-check + auto-insert headers (no AI)
-# - Detects missing symbols from compiler diagnostics
-# - Maps symbols→headers via tools/headers_map.json
-# - Inserts needed #include lines safely (after existing includes or at file top)
-# - Creates .bak backup before modifying
-# - Falls back to inserting common headers if regex finds no symbols
-# - Works with clang/gcc/msvc (cl)
-
 #!/usr/bin/env python3
 # fixer.py — C/C++/Python test fixer (no AI)
 # - C/C++ (.c/.cpp): compile-check, detect missing symbols, insert headers, re-check
 # - Header (.h): self-containment check via temp TU; insert headers into the header file
-# - Python (.py): py_compile; auto-insert `import unittest` if used but missing
+# - Python (.py): static import completion via __python__ map, then py_compile
 # - English logs, .bak backup, safe insertion, script-dir based mapping path
 
 import sys
@@ -57,7 +49,7 @@ def insert_headers_safely(file_path: str, headers: list[str]) -> bool:
     if insert_idx == 0:
         new_lines.insert(len(to_insert), "")  # blank line after inserted block
 
-    new_src = eol.join(new_lines)
+    new_src = detect_eol(src).join(new_lines)
     if src.endswith(("\n", "\r\n")) and not new_src.endswith(("\n", "\r\n")):
         new_src += eol
 
@@ -158,6 +150,86 @@ def py_syntax_check(py_path: str) -> tuple[int, str]:
     diag = (proc.stderr or "") + (proc.stdout or "")
     return proc.returncode, diag
 
+def py_parse_existing_imports(src: str) -> set[str]:
+    """
+    Parse existing import statements to avoid duplicates.
+    Returns a set of imported root modules / aliases / member names.
+    """
+    imported = set()
+    for line in src.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("import "):
+            body = line[len("import "):]
+            parts = [p.strip() for p in body.split(",")]
+            for p in parts:
+                if " as " in p:
+                    mod, alias = [x.strip() for x in p.split(" as ", 1)]
+                    imported.add(mod.split(".")[0])
+                    imported.add(alias)
+                else:
+                    imported.add(p.split(".")[0])
+        elif line.startswith("from "):
+            try:
+                after_from = line[len("from "):]
+                mod, after_mod = after_from.split(" import ", 1)
+                imported.add(mod.split(".")[0])
+                members = [m.strip() for m in after_mod.split(",")]
+                for m in members:
+                    if " as " in m:
+                        name, alias = [x.strip() for x in m.split(" as ", 1)]
+                        imported.add(name)
+                        imported.add(alias)
+                    else:
+                        imported.add(m)
+            except ValueError:
+                pass
+    return imported
+
+def py_required_import_lines(src: str, py_map: dict) -> list[str]:
+    """
+    Decide which import lines are needed based on tokens present in source.
+    Uses simple token matching (MVP), de-duplicates, keeps order.
+    """
+    needed = []
+    imported = py_parse_existing_imports(src)
+
+    for key, import_lines in py_map.items():
+        # Build essential names (module roots and imported names/aliases)
+        essential_names = []
+        for line in import_lines:
+            s = line.strip()
+            if s.startswith("import "):
+                body = s[len("import "):].strip()
+                name = body.split(" as ")[-1].strip() if " as " in body else body
+                essential_names.append(name.split(".")[0])
+            elif s.startswith("from "):
+                try:
+                    after_from = s[len("from "):]
+                    mod, after_mod = after_from.split(" import ", 1)
+                    essential_names.append(mod.split(".")[0])
+                    for m in [m.strip() for m in after_mod.split(",")]:
+                        essential_names.append((m.split(" as ")[-1]).strip())
+                except ValueError:
+                    pass
+
+        already_have = any(n in imported for n in essential_names)
+        if already_have:
+            continue
+
+        # Only add if the key actually appears in source tokens
+        if re.search(rf"\b{re.escape(key)}\b", src):
+            needed.extend(import_lines)
+
+    # unique & preserve order
+    seen, ordered = set(), []
+    for ln in needed:
+        if ln not in seen:
+            seen.add(ln)
+            ordered.append(ln)
+    return ordered
+
 def ensure_py_import(py_path: str, module: str) -> bool:
     p = pathlib.Path(py_path).resolve()
     src = p.read_text(encoding="utf-8")
@@ -174,26 +246,47 @@ def ensure_py_import(py_path: str, module: str) -> bool:
 
 def handle_python(py_path: str):
     print("🐍 Checking Python test…")
-    code, diag = py_syntax_check(py_path)
+    p = pathlib.Path(py_path).resolve()
+    src = p.read_text(encoding="utf-8")
+
+    mapping = load_map()
+    py_map = mapping.get("__python__", {})
+
+    # Static add of missing imports based on __python__ mapping
+    missing_import_lines = py_required_import_lines(src, py_map)
+    if missing_import_lines:
+        print("➕ Inserting missing Python imports:", ", ".join(missing_import_lines))
+        lines = src.splitlines()
+        insert_idx = 1 if (lines and lines[0].startswith("#!")) else 0
+        new_lines = lines[:insert_idx] + missing_import_lines + [""] + lines[insert_idx:]
+        bak = p.with_suffix(p.suffix + ".bak")
+        shutil.copy2(p, bak)
+        p.write_text("\n".join(new_lines) + ("\n" if src.endswith("\n") else ""), encoding="utf-8")
+        src = p.read_text(encoding="utf-8")
+
+    code, diag = py_syntax_check(str(p))
     if code == 0:
-        print("✅ Python syntax OK. No fix needed.")
+        print("✅ Python syntax OK.")
         return
-    print("⚠️ Python compile failed. Analyzing…")
-    txt = pathlib.Path(py_path).read_text(encoding="utf-8")
-    uses_unittest = bool(re.search(r"\bunittest\b|\bTestCase\b", txt))
-    has_unittest_import = bool(re.search(r"^\s*import\s+unittest\b", txt, re.M))
+
+    print("⚠️ Python compile failed. Diagnostics:")
+    print(diag)
+
+    # Fallback: if unittest usage still without import, add once
+    uses_unittest = bool(re.search(r"\bunittest\b|\bTestCase\b", src))
+    has_unittest_import = bool(re.search(r"^\s*import\s+unittest\b", src, re.M))
     if uses_unittest and not has_unittest_import:
-        changed = ensure_py_import(py_path, "unittest")
+        changed = ensure_py_import(str(p), "unittest")
         if changed:
-            print("➕ Inserted 'import unittest' (backup created). Rechecking…")
-            code2, diag2 = py_syntax_check(py_path)
+            print("🛟 Fallback: inserted 'import unittest'. Rechecking…")
+            code2, diag2 = py_syntax_check(str(p))
             if code2 == 0:
-                print("✅ Python fixed. Syntax OK after adding unittest.")
+                print("✅ Python fixed after fallback.")
                 return
             else:
-                print("❌ Still failing after adding unittest:\n" + diag2)
+                print("❌ Still failing after fallback:\n" + diag2)
                 sys.exit(5)
-    print("❌ Python compile still failing. Diagnostics:\n" + diag)
+
     sys.exit(5)
 
 # -------------- Header (.h) handler --------------
@@ -296,3 +389,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
